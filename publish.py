@@ -5,24 +5,30 @@
     python3 publish.py --clear
 
 It copies the post's images into days/<date>/, rewrites latest.json, drops days older than --keep,
-then commits and pushes (--no-push stops after the commit). It needs only Python 3 and git, with push
-access to this repo.
+then commits and pushes (--no-push stops after the commit). Everything here is public, so each image
+loses its metadata (Exif, XMP, Photoshop, text) on the way in, and one in another colour space, such as
+Display P3, is converted to sRGB (that part needs Pillow; without it, a note says so). It needs only
+Python 3 and git, with push access to this repo.
 """
 import argparse
 import datetime
 import hashlib
+import io
 import json
 import os
 import shutil
 import struct
 import subprocess
 import sys
+import zlib
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SITE = "https://ricky-zombie.github.io/underglow-daily/latest.json"
 MAX_BYTES = 8 * 1024 * 1024  # the game's own limits
 MIN_SIDE, MAX_SIDE = 16, 4096
 JPEG_FRAMES = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+JPEG_METADATA = {0xE1, 0xED, 0xFE}  # APP1 (Exif, XMP), APP13 (Photoshop, IPTC), comments
+PNG_METADATA = {b"tEXt", b"zTXt", b"iTXt", b"tIME", b"eXIf"}
 
 
 def kind_and_size(data):
@@ -46,6 +52,101 @@ def kind_and_size(data):
             else:
                 i += 2 + struct.unpack(">H", data[i + 2:i + 4])[0]
     return None
+
+
+def exif_orientation(segment):
+    """The Orientation tag of an APP1 Exif segment; 1 (upright) if it has none."""
+    t = segment[10:]  # after the marker, the length and "Exif\0\0"
+    try:
+        e = {b"II": "<", b"MM": ">"}[t[:2]]
+        ifd = struct.unpack(e + "I", t[4:8])[0]
+        for k in range(struct.unpack(e + "H", t[ifd:ifd + 2])[0]):
+            p = ifd + 2 + 12 * k
+            if struct.unpack(e + "H", t[p:p + 2])[0] == 0x0112:
+                return struct.unpack(e + "H", t[p + 8:p + 10])[0]
+    except (KeyError, struct.error):
+        pass
+    return 1
+
+
+def strip_jpeg(data):
+    """The JPEG without its metadata segments, its colour profile (None if it has none), and its
+    Exif orientation."""
+    keep, icc, orientation, i = [data[:2]], b"", 1, 2
+    while i + 4 <= len(data) and data[i] == 0xFF:
+        marker = data[i + 1]
+        if marker == 0xFF:
+            i += 1
+            continue
+        if marker == 0xDA:  # the image data, kept as it is from here on
+            break
+        end = i + 2 if marker == 0x01 or 0xD0 <= marker <= 0xD7 else i + 2 + struct.unpack(">H", data[i + 2:i + 4])[0]
+        seg = data[i:end]
+        if marker == 0xE1 and seg[4:10] == b"Exif\0\0":
+            orientation = exif_orientation(seg)
+        if marker == 0xE2 and seg[4:16] == b"ICC_PROFILE\0":
+            icc += seg[18:]  # after its name and the part's number and count
+        if marker not in JPEG_METADATA:
+            keep.append(seg)
+        i = end
+    return b"".join(keep) + data[i:], icc or None, orientation
+
+
+def strip_png(data):
+    """The PNG without its text, time and Exif chunks, and its colour profile (None if it has none)."""
+    keep, icc, i = [data[:8]], None, 8
+    while i + 12 <= len(data):
+        n = struct.unpack(">I", data[i:i + 4])[0]
+        kind = data[i + 4:i + 8]
+        if kind == b"iCCP":
+            body = data[i + 8:i + 8 + n]
+            icc = zlib.decompress(body[body.index(b"\0") + 2:])
+        if kind not in PNG_METADATA:
+            keep.append(data[i:i + 12 + n])
+        i += 12 + n
+        if kind == b"IEND":
+            break
+    return b"".join(keep), icc
+
+
+def to_srgb(data, kind, icc):
+    """The image converted to sRGB, untagged and without metadata; None without Pillow."""
+    try:
+        from PIL import Image, ImageCms
+    except ImportError:
+        return None
+    try:
+        im = Image.open(io.BytesIO(data))
+        mode = "RGBA" if "A" in im.getbands() or "transparency" in im.info else "RGB"
+        im = ImageCms.profileToProfile(im.convert(mode), ImageCms.ImageCmsProfile(io.BytesIO(icc)),
+                                       ImageCms.createProfile("sRGB"), outputMode=mode)
+        out = io.BytesIO()
+        if kind == "png":
+            im.save(out, "PNG", optimize=True)
+        else:
+            im.convert("RGB").save(out, "JPEG", quality=95, subsampling=0)
+        return out.getvalue()
+    except Exception as e:  # an odd profile: keep the image as it was
+        print(f"note: couldn't convert it to sRGB ({e})")
+        return None
+
+
+def clean(path, data, kind):
+    """The image as it goes public: without its metadata, and in sRGB where it can be converted."""
+    if kind == "jpg":
+        data, icc, orientation = strip_jpeg(data)
+        if orientation != 1:
+            sys.exit(f"{path}: its Exif turns it (orientation {orientation}); save it upright and publish again")
+    else:
+        data, icc = strip_png(data)
+    if icc is None or b"sRGB" in icc or "sRGB".encode("utf-16-be") in icc:
+        return data
+    converted = to_srgb(data, kind, icc)
+    if converted is None:
+        print(f"note: {path} isn't sRGB, and without Pillow it can't be converted: the game shows it a little duller")
+        return data
+    print(f"{path}: converted to sRGB")
+    return converted
 
 
 def git(*args, capture=False):
@@ -88,6 +189,9 @@ def main():
             sys.exit(f"{path}: {len(data) / 1e6:.1f} MB; the limit is 8 MB")
         if not (MIN_SIDE <= w <= MAX_SIDE and MIN_SIDE <= h <= MAX_SIDE):
             sys.exit(f"{path}: {w} x {h} px; each side must be {MIN_SIDE} to {MAX_SIDE}")
+        data = clean(path, data, kind)
+        if len(data) > MAX_BYTES:
+            sys.exit(f"{path}: {len(data) / 1e6:.1f} MB once converted; the limit is 8 MB")
         posts.append((data, kind))
 
     git("pull", "--ff-only", "--quiet")

@@ -17,13 +17,16 @@ python3 publish.py path/to/post.png --title "The day's title" --link https://www
 - Give the post's images in order. The game shows the first.
 - PNG or JPEG, up to 8 MB and 4096 px a side.
 - The lightbox is portrait, 1.2 x 1.73 m (about 0.69 : 1). A 4:5 post fills its width, with thin bands
-  above and below in the colour of the image's top-left corner.
+  above and below in the colours of its own top and bottom edges, so a sky or a floor runs on into them.
+- Each image loses its metadata (Exif, XMP, Photoshop, text) on the way in. One in another colour space,
+  such as Display P3, is converted to sRGB, which is what the game reads.
 - It copies the images into `days/<date>/`, rewrites `latest.json`, drops days older than two weeks
   (git keeps them), then commits and pushes.
 - `--date YYYY-MM-DD` publishes for another day (the default is today). `--no-push` commits without pushing.
 - `python3 publish.py --clear` takes the comic down, and the game goes back to its stock ad.
 
-It needs only Python 3 and git: a git name and email, and push access to this repo.
+It needs Python 3 and git, with a git name and email and push access to this repo. Converting Display P3
+and other colour spaces needs Pillow too (`pip install pillow`); without it, a note says the image wasn't converted.
 
 ## Push access
 
